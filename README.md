@@ -39,9 +39,9 @@ git add .
 git status
 git commit -m "Version x.x"
 git branch -M main
-git remote add origin https://github.com/<login>/<repo>.git   # first time
+git remote add origin https://github.com/Byte-tern/nuke_hack.git   # first time
 git push -u origin main
 
 User device:
 
-git clone https://github.com/<login>/<repo>.git
+git clone https://github.com/Byte-tern/nuke_hack.git
