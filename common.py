@@ -1,11 +1,12 @@
+"""Общие утилиты: калибровка (дисторсия + гомографии камера->план), маски, время."""
 import json
 import os
 import numpy as np
 import cv2
 
 CAMERAS = [1, 2, 3, 4, 5]
-CANON = (1600, 1200)          
-PLAN_SIZE = (180, 440)        
+CANON = (1600, 1200)          # канонический размер кадра (из ТЗ); все расчёты ведутся в нём
+PLAN_SIZE = (180, 440)        # officePlan.jpg: ширина x высота, пиксели плана
 CALIB_FILE = "calibration.json"
 
 
@@ -14,6 +15,7 @@ def video_path(root, cam):
 
 
 def fmt_time(frame, fps):
+    """чч:мм:сс:мс (время от начала записи)."""
     ms = int(round(frame / fps * 1000.0))
     h, ms = divmod(ms, 3600000)
     m, ms = divmod(ms, 60000)
@@ -21,12 +23,16 @@ def fmt_time(frame, fps):
     return f"{h:02d}:{m:02d}:{s:02d}:{ms:03d}"
 
 
+# ---------------------------------------------------------------- дисторсия
+# Однопараметрическая "division model":  p_u = c + (p_d - c) / (1 + k * r_d^2),
+# r_d = |p_d - c| / R,  R = половина диагонали кадра.  k < 0 -> бочка (широкоугольник).
 def _geom():
     W, H = CANON
     return np.array([W / 2.0, H / 2.0]), float(np.hypot(W, H) / 2.0)
 
 
 def undistort_px(pts, k):
+    """pts: (N,2) пиксели канонического кадра (искажённые) -> неискажённые."""
     pts = np.asarray(pts, np.float64).reshape(-1, 2)
     c, R = _geom()
     d = pts - c
@@ -35,6 +41,7 @@ def undistort_px(pts, k):
 
 
 def distort_px(pts, k):
+    """Обратное преобразование (нужно для отрисовки проверок и remap)."""
     pts = np.asarray(pts, np.float64).reshape(-1, 2)
     c, R = _geom()
     d = pts - c
@@ -49,6 +56,7 @@ def distort_px(pts, k):
 
 
 def undistort_image(img, k):
+    """Для визуальной проверки коэффициента (кадр -> неискажённый кадр)."""
     h, w = img.shape[:2]
     gx, gy = np.meshgrid(np.arange(w), np.arange(h))
     pts = np.stack([gx.ravel() * CANON[0] / w, gy.ravel() * CANON[1] / h], 1)
@@ -58,6 +66,7 @@ def undistort_image(img, k):
     return cv2.remap(img, mapx, mapy, cv2.INTER_LINEAR)
 
 
+# ---------------------------------------------------------------- калибровка
 class Calibration:
     def __init__(self, data=None):
         self.data = data or {"k1": 0.0, "plan_size": list(PLAN_SIZE),
@@ -68,6 +77,7 @@ class Calibration:
         self._mask_cache = {}
         self._ghost = {}
 
+    # --- io
     @staticmethod
     def load(path=CALIB_FILE):
         if not os.path.exists(path):
@@ -92,6 +102,7 @@ class Calibration:
     def weight(self, c):
         return float(self.cam(c).get("weight", 1.0))
 
+    # --- гомография камера -> план
     def homography(self, c):
         if c in self._H:
             return self._H[c]
@@ -118,6 +129,7 @@ class Calibration:
         return self.homography(c) is not None
 
     def to_plan(self, c, pts_px):
+        """Точки (канонические пиксели кадра, искажённые) -> координаты плана."""
         H = self.homography(c)
         u = undistort_px(pts_px, self.k1)
         return cv2.perspectiveTransform(u.reshape(-1, 1, 2), H).reshape(-1, 2)
@@ -128,6 +140,7 @@ class Calibration:
                                      np.linalg.inv(H)).reshape(-1, 2)
         return distort_px(p, self.k1)
 
+    # --- проходимая область плана
     def walkable_mask(self, margin=0):
         key = int(margin)
         if key in self._mask_cache:
@@ -146,11 +159,12 @@ class Calibration:
 
     def is_walkable(self, xy, margin=0):
         if not self.data.get("walkable"):
-            return True                
+            return True                      # полигон не размечен -> не фильтруем
         m = self.walkable_mask(margin)
         x, y = int(round(xy[0])), int(round(xy[1]))
         return 0 <= y < m.shape[0] and 0 <= x < m.shape[1] and m[y, x] > 0
 
+    # --- статичные маски "призраков" (ТВ и т.п.) в пикселях камеры
     def ghost_mask(self, c):
         if c not in self._ghost:
             m = np.zeros((CANON[1], CANON[0]), np.uint8)
@@ -159,3 +173,19 @@ class Calibration:
                 cv2.fillPoly(m, [pts], 1)
             self._ghost[c] = m
         return self._ghost[c]
+
+
+# ---------------------------------------------------------------- синхронизация камер по времени
+def build_timeline(info, target_fps):
+    """Единая шкала времени для камер с РАЗНЫМ fps.
+    info: {cam: (fps, n_frames)}; target_fps - общий fps шкалы.
+    Кадр шкалы k соответствует моменту t=(k+0.5)/target_fps; из камеры берётся кадр floor(t*fps_cam).
+    Индекс считается из времени, а не накопительным счётчиком -> ошибка не копируется:
+    у камеры с большим fps кадры равномерно пропускаются, у камеры с меньшим - равномерно дублируются.
+    Все записи начинаются и заканчиваются одновременно: длительность шкалы = min(n/fps) по камерам.
+    Возвращает (N кадров шкалы, {cam: int32-массив индексов исходных кадров длиной N})."""
+    dur = min(n / float(f) for f, n in info.values())
+    N = int(np.floor(dur * target_fps + 1e-6))
+    t = (np.arange(N) + 0.5) / target_fps
+    idx = {c: np.minimum(np.floor(t * f).astype(np.int64), n - 1).astype(np.int32) for c, (f, n) in info.items()}
+    return N, idx

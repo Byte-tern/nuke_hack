@@ -1,3 +1,13 @@
+"""
+Этап 1 (GPU, долгий): покадровое обнаружение людей (YOLO-pose) + локальный трекинг BoT-SORT на каждой камере
++ фильтрация аномалий (план/зеркало, маска ТВ, разделение "обнимающихся") + проекция стоп на план.
+Для далёких людей: "зоны детального поиска" (zoom ROI) - детектор дополнительно запускается на вырезке
+из кадра ПОЛНОГО разрешения (2592x1944), результат объединяется с обычной детекцией.
+Результат -> local_tracks.pkl (используется fusion.py).
+
+  python stage1_detect_track.py --root . --calib calibration.json --out local_tracks.pkl
+  python stage1_detect_track.py --root . --zoom 3:0.18,0.0,0.50,0.45      # доп. зона на камере 3 (x1,y1,x2,y2 в долях кадра)
+"""
 import argparse
 import pickle
 import queue
@@ -11,35 +21,59 @@ from common import *
 ANKLES = (15, 16)
 
 
+# ------------------------------------------------------------------ чтение видео в потоках
+def probe(path, fps_override=None):
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise SystemExit("не открывается " + path)
+    fps = fps_override or cap.get(cv2.CAP_PROP_FPS)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    size = (int(cap.get(3)), int(cap.get(4)))
+    cap.release()
+    if not fps or fps <= 0 or fps > 240 or n <= 0:
+        raise SystemExit(f"{path}: не удалось определить fps/число кадров (fps={fps}, n={n}); задайте --fps-override КАМЕРА:FPS")
+    return float(fps), n, size
+
+
 class Reader(threading.Thread):
-    def __init__(self, path, start, end, keep_full=False, qsize=4):
+    """Отдаёт кадры шкалы времени: (кадр 1600x1200, кадр полного разрешения|None, индекс исходного кадра, новый ли он).
+    Кадры с большим fps пропускаются (grab без декодирования картинки), с меньшим - повторяются (дубликат без повторного чтения)."""
+
+    def __init__(self, path, src_idx, keep_full=False, qsize=4):
         super().__init__(daemon=True)
-        self.cap = cv2.VideoCapture(path)
-        if not self.cap.isOpened():
-            raise SystemExit("не открывается " + path)
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
-        self.n = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.size = (int(self.cap.get(3)), int(self.cap.get(4)))
-        if start:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-        self.end, self.keep_full = end, keep_full
+        self.path, self.idx, self.keep_full = path, src_idx, keep_full
         self.q = queue.Queue(qsize)
         self.start()
 
     def run(self):
-        i = 0
-        while self.end is None or i < self.end:
-            ok, fr = self.cap.read()
-            if not ok:
-                break
-            small = cv2.resize(fr, CANON, interpolation=cv2.INTER_AREA)
-            self.q.put((small, fr if self.keep_full else None))
-            i += 1
+        cap = cv2.VideoCapture(self.path)
+        cur, last = -1, None
+        for i, s in enumerate(self.idx):
+            s = int(s)
+            if i == 0:
+                if s > 0:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, s)
+                cur = s - 1
+            new = (s != cur)
+            if new:
+                for _ in range(s - cur - 1):                 # пропуск лишних кадров
+                    cap.grab()
+                ok, fr = cap.read()
+                cur = s
+                if ok:
+                    last = (cv2.resize(fr, CANON, interpolation=cv2.INTER_AREA), fr if self.keep_full else None)
+                elif last is None:
+                    break
+                else:
+                    new = False                                # файл закончился раньше - держим последний кадр
+            self.q.put((last[0], last[1], s, new))
         self.q.put(None)
 
 
-
+# ------------------------------------------------------------------ детекции
 class Dets:
+    """Минимальный контейнер для BoT-SORT из ultralytics (numpy-атрибуты, поддерживает results[mask])."""
+
     def __init__(self, xyxy, conf, cls):
         self.xyxy = xyxy.astype(np.float32).reshape(-1, 4)
         self.conf = conf.astype(np.float32)
@@ -81,6 +115,7 @@ def iou_matrix(a, b):
 
 
 def detect_roi(model, full, roi, args, device, kw):
+    """Детекция по вырезке полного кадра (далёкие люди крупнее в пикселях); координаты -> канонический кадр."""
     Hf, Wf = full.shape[:2]
     x0, y0, x1, y1 = [int(round(v)) for v in (roi[0] * Wf, roi[1] * Hf, roi[2] * Wf, roi[3] * Hf)]
     crop = full[y0:y1, x0:x1]
@@ -94,6 +129,7 @@ def detect_roi(model, full, roi, args, device, kw):
     off = np.array([x0, y0], np.float32); sc = np.array([sx, sy], np.float32)
     ob, oc, ok_ = [], [], []
     for bb, c, k in zip(b, cf, kps):
+        # обрезанные краем окна (но не краем кадра) люди отбрасываем - их увидит обычная детекция
         if (bb[0] < 3 and x0 > 0) or (bb[1] < 3 and y0 > 0) or (bb[2] > cw - 3 and x1 < Wf) or (bb[3] > ch - 3 and y1 < Hf):
             continue
         ob.append(np.concatenate([(bb[:2] + off) * sc, (bb[2:] + off) * sc])); oc.append(c)
@@ -102,6 +138,7 @@ def detect_roi(model, full, roi, args, device, kw):
 
 
 def merge_dets(parts, iou_thr=0.6):
+    """Объединение детекций (полный кадр + зоны): жадный NMS по уверенности."""
     b = np.concatenate([p[0] for p in parts]) if parts else np.zeros((0, 4), np.float32)
     c = np.concatenate([p[1] for p in parts]) if parts else np.zeros(0, np.float32)
     k = [x for p in parts for x in p[2]]
@@ -117,6 +154,7 @@ def merge_dets(parts, iou_thr=0.6):
 
 
 def split_hugs(boxes, confs, kps, ar_thr):
+    """Запасное правило для "обнимающихся": слишком широкий бокс делится на два. Основной механизм - pose + высокий IoU NMS."""
     ob, oc, ok_ = [], [], []
     for b, c, k in zip(boxes, confs, kps):
         w, h = b[2] - b[0], b[3] - b[1]
@@ -130,6 +168,7 @@ def split_hugs(boxes, confs, kps, ar_thr):
 
 
 def foot_of(box, kp):
+    """Точка касания пола: средняя точка видимых лодыжек, иначе - низ бокса (ненадёжно)."""
     if kp is not None:
         xy, cf = kp
         pts = [xy[i] for i in ANKLES if cf[i] > 0.5]
@@ -140,19 +179,20 @@ def foot_of(box, kp):
 
 
 def filter_detections(cam, cal, boxes, kps, args):
+    """Исключение аномалий. Возвращает индексы оставшихся, координаты стоп на плане и флаги надёжности."""
     W, H = CANON
     keep, plan_xy, foot_ok = [], [], []
     gm = cal.ghost_mask(cam)
     for i, (b, k) in enumerate(zip(boxes, kps)):
         foot, ok = foot_of(b, k)
-#  TV
+        # 1) статичная маска (включённый ТВ): стопы "человека с экрана" лежат в маске, либо бокс почти целиком в ней
         if gm.any():
             fx, fy = int(np.clip(foot[0], 0, W - 1)), int(np.clip(foot[1], 0, H - 1))
             x1, y1, x2, y2 = [int(v) for v in b]
             sub = gm[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)]
             if gm[fy, fx] > 0 or (sub.size and sub.mean() >= args.mask_ratio):
                 continue
-#  Mirror - projection outside viewable zone
+        # 2) проекция на план; зеркало -> отражение проецируется за стену, т.е. вне проходимой области
         if cal.is_calibrated(cam):
             p = cal.to_plan(cam, foot[None])[0]
             if not cal.is_walkable(p, args.walk_margin if ok else args.walk_margin_soft):
@@ -176,19 +216,22 @@ def main():
     ap.add_argument("--root", default=".")
     ap.add_argument("--calib", default=CALIB_FILE)
     ap.add_argument("--out", default="local_tracks.pkl")
-    ap.add_argument("--model", default="yolo11m-pose.pt", help="any YOLO pose-model or default det (yolo11m.pt)")
+    ap.add_argument("--model", default="yolo11m-pose.pt", help="любая YOLO pose-модель (или обычная det, например yolo11m.pt)")
     ap.add_argument("--imgsz", type=int, default=1280)
     ap.add_argument("--conf", type=float, default=0.15)
-    ap.add_argument("--nms-iou", type=float, default=0.85, help="big IoU: avoid merging huggers")
+    ap.add_argument("--nms-iou", type=float, default=0.85, help="высокий IoU: не сливать вплотную стоящих/обнимающихся")
     ap.add_argument("--tracker", default="botsort_static.yaml")
-    ap.add_argument("--zoom", action="append", help="extra detection zone")
+    ap.add_argument("--zoom", action="append", help="доп. зона детекции 'камера:x1,y1,x2,y2' (доли кадра); можно несколько раз")
     ap.add_argument("--zoom-imgsz", type=int, default=1280)
-    ap.add_argument("--hug-ar", type=float, default=0.0, help="splitting wide box (hugs)")
+    ap.add_argument("--hug-ar", type=float, default=0.0, help="порог w/h для принудительного деления слишком широкого бокса (0 = выкл.)")
     ap.add_argument("--mask-ratio", type=float, default=0.8)
-    ap.add_argument("--walk-margin", type=int, default=6)
-    ap.add_argument("--walk-margin-soft", type=int, default=25)
-    ap.add_argument("--start", type=int, default=0)
-    ap.add_argument("--max-frames", type=int, default=None)
+    ap.add_argument("--walk-margin", type=int, default=6, help="допуск (пикс. плана) для надёжных стоп")
+    ap.add_argument("--walk-margin-soft", type=int, default=25, help="допуск, если стопы не видны (низ бокса)")
+    ap.add_argument("--target-fps", type=float, default=None,
+                    help="общий fps шкалы времени (по умолчанию - медиана fps камер): у камер с большим fps кадры пропускаются, с меньшим - дублируются")
+    ap.add_argument("--fps-override", action="append", help="принудительно задать fps камеры 'камера:fps' (если контейнер врёт), можно несколько раз")
+    ap.add_argument("--start", type=int, default=0, help="начальный кадр ШКАЛЫ времени")
+    ap.add_argument("--max-frames", type=int, default=None, help="сколько кадров шкалы обработать")
     ap.add_argument("--device", default=None)
     ap.add_argument("--allow-uncalibrated", action="store_true")
     ap.add_argument("--cameras", type=int, nargs="+", default=CAMERAS)
@@ -200,7 +243,7 @@ def main():
     try:
         from ultralytics.utils import YAML
         load_yaml = YAML.load
-    except ImportError:                      
+    except ImportError:                                   # старые версии ultralytics
         from ultralytics.utils import yaml_load as load_yaml
     from ultralytics.trackers.bot_sort import BOTSORT
 
@@ -208,52 +251,73 @@ def main():
     cal = Calibration.load(args.calib)
     for c in args.cameras:
         if not cal.is_calibrated(c) and not args.allow_uncalibrated:
-            raise SystemExit(f"cam {c} not calibrated")
+            raise SystemExit(f"камера {c} не откалибрована (нужно >=4 пар точек: python calibrate.py points --camera {c})")
     rois = parse_zoom(args.zoom, cal, args.cameras)
-    print(f"[init] device={device}, detailed search zones: { {c: r for c, r in rois.items() if r} }")
+    print(f"[init] device={device}, зоны детального поиска: { {c: r for c, r in rois.items() if r} }")
     model = YOLO(args.model)
     kw = {"half": True} if device != "cpu" else {}
 
-    readers = {c: Reader(video_path(args.root, c), args.start, args.max_frames, keep_full=bool(rois.get(c)))
-               for c in args.cameras}
-    fps = readers[args.cameras[0]].fps
-    n_total = min(r.n for r in readers.values()) - args.start
+    # --- единая шкала времени для камер с разным fps
+    ov = {int(x.split(":")[0]): float(x.split(":")[1]) for x in (args.fps_override or [])}
+    info = {c: probe(video_path(args.root, c), ov.get(c)) for c in args.cameras}
+    src_fps = {c: info[c][0] for c in args.cameras}
+    fps = float(args.target_fps or np.median(list(src_fps.values())))
+    N_total, src_idx = build_timeline({c: (info[c][0], info[c][1]) for c in args.cameras}, fps)
+    durs = {c: info[c][1] / info[c][0] for c in args.cameras}
+    print("[sync] fps камер:", {c: round(v, 3) for c, v in src_fps.items()}, "| fps шкалы:", round(fps, 3),
+          "| длительности, с:", {c: round(v, 1) for c, v in durs.items()}, "| кадров шкалы:", N_total)
+    for c in args.cameras:
+        dup = np.mean(np.diff(src_idx[c]) == 0) if N_total > 1 else 0.0
+        skip = np.mean(np.diff(src_idx[c]) > 1) if N_total > 1 else 0.0
+        if dup > 0 or skip > 0:
+            print(f"[sync] камера {c}: дублируется {dup:.0%} кадров, пропускается ~{skip:.0%}")
+    if max(durs.values()) - min(durs.values()) > 1.0:
+        print("[sync] ВНИМАНИЕ: длительности записей различаются больше 1 с - проверьте fps (--fps-override); хвост длинных записей отбрасывается")
+    n_total = N_total - args.start
     if args.max_frames:
         n_total = min(n_total, args.max_frames)
+    readers = {c: Reader(video_path(args.root, c), src_idx[c][args.start:args.start + n_total], keep_full=bool(rois.get(c)))
+               for c in args.cameras}
     tcfg = IterableSimpleNamespace(**load_yaml(args.tracker))
     import inspect
     _params = [p for p in inspect.signature(BOTSORT.__init__).parameters if p not in ("self", "args")]
-    _kw = {_params[0]: int(round(fps))} if _params else {}      
+    _kw = {_params[0]: int(round(fps))} if _params else {}      # имя параметра fps/frame_rate зависит от версии
     trackers = {c: BOTSORT(tcfg, **_kw) for c in args.cameras}
 
-    rows = []           # (f, cam, tid, x1,y1,x2,y2, conf, px, py, foot_ok)
+    rows = []           # (f, cam, tid, x1,y1,x2,y2 (норм.), conf, px, py, foot_ok); f - кадр ШКАЛЫ времени
+    cache = {}          # камера -> (боксы, conf, план, foot_ok) последней детекции (для дублированных кадров детектор не запускается)
+    cams = list(args.cameras)
+    processed = 0
     t0 = time.time()
     for f in range(n_total):
-        frames, fulls = {}, {}
-        for c in args.cameras:
-            item = readers[c].q.get()
-            if item is not None:
-                frames[c], fulls[c] = item
-        if not frames:
+        items = {}
+        for c in cams:
+            it = readers[c].q.get()
+            if it is not None:
+                items[c] = it
+        if len(items) < len(cams):
             break
-        cams = list(frames)
-        results = model.predict([frames[c] for c in cams], imgsz=args.imgsz, conf=args.conf, iou=args.nms_iou,
-                                classes=[0], device=device, verbose=False, **kw)
-        for c, r in zip(cams, results):
-            parts = [parse_result(r)]
-            if fulls.get(c) is not None:
-                for roi in rois.get(c, []):
-                    parts.append(detect_roi(model, fulls[c], roi, args, device, kw))
-            b, cf, kps = merge_dets(parts)
-            b, cf, kps = split_hugs(b, cf, kps, args.hug_ar)
-            keep, plan_xy, foot_ok = filter_detections(c, cal, b, kps, args)
-            b, cf = b[keep], cf[keep]
-            det = Dets(b, cf, np.zeros(len(keep)))
-            tr = trackers[c].update(det, frames[c])
+        new = [c for c in cams if items[c][3] or c not in cache]
+        if new:
+            results = model.predict([items[c][0] for c in new], imgsz=args.imgsz, conf=args.conf, iou=args.nms_iou,
+                                    classes=[0], device=device, verbose=False, **kw)
+            for c, r in zip(new, results):
+                parts = [parse_result(r)]
+                if items[c][1] is not None:
+                    for roi in rois.get(c, []):
+                        parts.append(detect_roi(model, items[c][1], roi, args, device, kw))
+                b, cf, kps = merge_dets(parts)
+                b, cf, kps = split_hugs(b, cf, kps, args.hug_ar)
+                keep, plan_xy, foot_ok = filter_detections(c, cal, b, kps, args)
+                cache[c] = (b[keep], cf[keep], plan_xy, foot_ok)
+        for c in cams:
+            b, cf, plan_xy, foot_ok = cache[c]
+            det = Dets(b, cf, np.zeros(len(b)))
+            tr = trackers[c].update(det, items[c][0])
             if tr is None or len(tr) == 0 or len(b) == 0:
                 continue
             tr = np.asarray(tr)
-            iou = iou_matrix(tr[:, :4].astype(np.float32), b)
+            iou = iou_matrix(tr[:, :4].astype(np.float32), b)               # сопоставление трек -> детекция по IoU
             ti, di = linear_sum_assignment(1.0 - iou)
             for t_i, idx in zip(ti, di):
                 if iou[t_i, idx] < 0.3:
@@ -262,21 +326,24 @@ def main():
                 x1, y1, x2, y2 = b[idx]
                 rows.append([f + args.start, c, tid, x1 / CANON[0], y1 / CANON[1], x2 / CANON[0], y2 / CANON[1],
                              float(cf[idx]), float(plan_xy[idx][0]), float(plan_xy[idx][1]), bool(foot_ok[idx])])
-        if f % 50 == 0:
+        processed = f + 1
+        if f % 250 == 0:
             el = time.time() - t0
-            print(f"[{f}/{n_total}] {el / (f + 1):.3f} sec per frame, remaining ~{(n_total - f) * el / (f + 1) / 60:.1f} minutes", flush=True)
+            print(f"[{f}/{n_total}] {el / (f + 1):.3f} с/кадр, осталось ~{(n_total - f) * el / (f + 1) / 60:.1f} мин", flush=True)
+    n_total = processed
 
     arr = np.array(rows, dtype=object) if rows else np.zeros((0, 11), object)
     out = {
         "fps": fps, "n_frames": n_total, "start": args.start, "canon": CANON, "cameras": args.cameras,
-        "video_size": {c: readers[c].size for c in args.cameras},
+        "video_size": {c: info[c][2] for c in args.cameras},
+        "src_fps": src_fps, "src_index": src_idx,          # шкала времени -> индекс кадра исходного видео (для плеера)
         "f": arr[:, 0].astype(np.int32), "cam": arr[:, 1].astype(np.int8), "tid": arr[:, 2].astype(np.int32),
         "box": arr[:, 3:7].astype(np.float32), "conf": arr[:, 7].astype(np.float32),
         "plan": arr[:, 8:10].astype(np.float32), "foot_ok": arr[:, 10].astype(bool),
     }
     with open(args.out, "wb") as fh:
         pickle.dump(out, fh, protocol=4)
-    print("saved", args.out)
+    print("сохранено", args.out, "строк:", len(rows))
 
 
 if __name__ == "__main__":
