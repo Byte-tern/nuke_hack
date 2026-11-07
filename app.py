@@ -1,8 +1,3 @@
-"""
-ДЕМО - Цифровые знахари. Интерфейс по макету interface.png (tkinter + Pillow + OpenCV).
-  python app.py --root . --result fusion_result.pkl --plan officePlan.jpg
-Зоны: 1-3 видео (5 камер, по умолчанию 2,4,5), 4-6 выбор камеры, 7 заголовок/счётчики, 8 таблица треков, 9 план.
-"""
 import argparse
 import time
 import tkinter as tk
@@ -29,7 +24,6 @@ class VideoZone:
         self.pos, self.img = -2, None
 
     def get(self, frame):
-        """Кадр с абсолютным номером frame (последовательное чтение, пропуск через grab, иначе seek)."""
         if frame == self.pos and self.img is not None:
             return self.img
         if self.pos < frame <= self.pos + 40:
@@ -58,7 +52,7 @@ class App:
         self._slider_lock = False
 
         t = self.t
-        t.title("ДЕМО - Цифровые знахари")
+        t.title("ДЕМО - Цифровые знахари team")
         sh = t.winfo_screenheight()
         self.vh = max(200, (sh - 90) // 3); self.vw = self.vh * 4 // 3
         self.pw = int(3 * self.vh * self.plan.shape[1] / self.plan.shape[0]); self.ph = 3 * self.vh
@@ -113,7 +107,6 @@ class App:
         self.render(force=True)
         self.tick()
 
-    # ---------------------------------------------------------------- камеры
     def current_cams(self):
         return [int(v.get().split()[-1]) for v in self.vars]
 
@@ -123,21 +116,21 @@ class App:
 
     def on_cam(self, z):
         cams = self.current_cams()
-        if cams.count(cams[z]) > 1:                    # одну камеру в двух зонах выбирать нельзя
+        if cams.count(cams[z]) > 1:  
             messagebox.showwarning("Выбор камеры", "Эта камера уже выбрана в другой зоне.")
             self.vars[z].set(f"Камера {self.zones[z].cam}")
             return
         self.zones[z].set_cam(cams[z])
         self.render(force=True)
 
-    # ---------------------------------------------------------------- управление
+
     def toggle(self):
         if self.playing:
-            self.playing = False; self.btn.config(text="▶ Пуск")
+            self.playing = False; self.btn.config(text="Пуск")
         else:
             if self.frame >= self.res.last_frame:
                 self.frame = self.res.start
-            self.playing = True; self.anchor = (time.perf_counter(), self.frame); self.btn.config(text="⏸ Пауза")
+            self.playing = True; self.anchor = (time.perf_counter(), self.frame); self.btn.config(text="Пауза")
 
     def on_scale(self, v):
         if self._slider_lock:
@@ -152,13 +145,12 @@ class App:
 
     def on_click(self, e):
         row = self.tree.identify_row(e.y)
-        if row and self.tree.selection() == (row,):          # повторный клик по выбранной строке снимает выбор
-            self.t.after_idle(self.clear_sel)
+        if row and self.tree.selection() == (row,):                      self.t.after_idle(self.clear_sel)
 
     def clear_sel(self):
         self.tree.selection_remove(self.tree.selection()); self.selected = None; self.render(force=True)
 
-    # ---------------------------------------------------------------- цикл
+
     def tick(self):
         if self.playing:
             el = time.perf_counter() - self.anchor[0]
@@ -166,8 +158,8 @@ class App:
             if tgt != self.frame:
                 self.frame = tgt
                 self.render()
-            if self.frame >= self.res.last_frame:       # конец: время останавливается, активные треки НЕ finished
-                self.playing = False; self.btn.config(text="▶ Пуск")
+            if self.frame >= self.res.last_frame: 
+                self.playing = False; self.btn.config(text="Пуск")
         self.t.after(8, self.tick)
 
     def render(self, force=False):

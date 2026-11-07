@@ -1,16 +1,10 @@
-# окружение и кэш
 venv/
 .venv/
 __pycache__/
 *.pyc
-# тяжёлые данные: видео (и персональные данные людей на них), промежуточные результаты, веса
 *.mkv
-*.mp4
-*.avi
 *.pkl
 *.pt
 *.onnx
 runs/
-# служебные картинки проверки калибровки
 calib_check_*.jpg
-# ВАЖНО: calibration.json (разметка камер/плана), officePlan.jpg, koef.png, office_camera.png, interface.png - в репозитории ОСТАЮТСЯ

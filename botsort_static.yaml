@@ -1,12 +1,11 @@
-# Параметры BoT-SORT (формат ultralytics). Камеры стационарные -> компенсация движения камеры отключена.
 tracker_type: botsort
-track_high_thresh: 0.35   # порог 1-й ассоциации (снижен: далёкие люди имеют низкую уверенность)
-track_low_thresh: 0.10    # порог 2-й ассоциации (частично закрытые люди)
+track_high_thresh: 0.35
+track_low_thresh: 0.10
 new_track_thresh: 0.40
-track_buffer: 30          # "допустимая пауза" - 30 кадров, как в ТЗ
+track_buffer: 30
 match_thresh: 0.80
 fuse_score: True
 gmc_method: none
 proximity_thresh: 0.5
 appearance_thresh: 0.25
-with_reid: False          # встроенный ReID трекера выключен (Re-ID в проекте не используется)
+with_reid: False
