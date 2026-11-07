@@ -1,15 +1,11 @@
-"""
-ДЕМО - Цифровые знахари. Интерфейс по макету interface.png (tkinter + Pillow + OpenCV).
-  python app.py --root . --result fusion_result.pkl --plan officePlan.jpg
-Зоны: 1-3 видео (5 камер, по умолчанию 2,4,5), 4-6 выбор камеры, 7 заголовок/счётчики, 8 таблица треков, 9 план.
-"""
 import argparse
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
 from PIL import Image, ImageTk
-from common import video_path, CANON
+import numpy as np
+from common import video_path, CANON, seek_read
 from result import Result, draw_video, draw_plan
 
 DEFAULT_CAMS = [2, 4, 5]
@@ -17,8 +13,9 @@ COLW = {"id": 90, "start": 150, "fin": 150, "cam": 55}
 
 
 class VideoZone:
-    def __init__(self, root, cam):
-        self.root, self.cam, self.cap, self.pos, self.img = root, None, None, -2, None
+
+    def __init__(self, root, cam, res):
+        self.root, self.res, self.cam, self.cap, self.pos, self.img, self.pts = root, res, None, None, -2, None, None
         self.set_cam(cam)
 
     def set_cam(self, cam):
@@ -27,19 +24,24 @@ class VideoZone:
         self.cam = cam
         self.cap = cv2.VideoCapture(video_path(self.root, cam))
         self.pos, self.img = -2, None
+        self.pts = self.res.pts_of(cam)
+        if self.pts is None:                
+            n = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.pts = np.arange(max(n, 1)) * 1000.0 / (self.cap.get(cv2.CAP_PROP_FPS) or 25.0)
 
-    def get(self, frame):
-        """Кадр с номером frame В ВИДЕО КАМЕРЫ (последовательное чтение, пропуск через grab, иначе seek)."""
-        if frame == self.pos and self.img is not None:
+    def get(self, i):
+        if i == self.pos and self.img is not None:
             return self.img
-        if self.pos < frame <= self.pos + 40:
-            for _ in range(frame - self.pos - 1):
+        if self.pos < i <= self.pos + 40:
+            for _ in range(i - self.pos - 1):
                 self.cap.grab()
+            ok, im = self.cap.read()
+            if ok:
+                self.img, self.pos = im, i
         else:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
-        ok, im = self.cap.read()
-        if ok:
-            self.img, self.pos = im, frame
+            im, j = seek_read(self.cap, self.pts, i)
+            if im is not None:
+                self.img, self.pos = im, j
         return self.img
 
 
@@ -73,7 +75,7 @@ class App:
                               postcommand=lambda z=z: self.refresh_values(z))
             cb.place(relx=1.0, y=0, anchor="ne")
             cb.bind("<<ComboboxSelected>>", lambda e, z=z: self.on_cam(z))
-            self.zones.append(VideoZone(a.root, DEFAULT_CAMS[z])); self.labels.append(lb)
+            self.zones.append(VideoZone(a.root, DEFAULT_CAMS[z], self.res)); self.labels.append(lb)
             self.combos.append(cb); self.vars.append(var)
             cb["values"] = [f"Камера {c}" for c in self.res.cameras]
 
@@ -113,7 +115,6 @@ class App:
         self.render(force=True)
         self.tick()
 
-    # ---------------------------------------------------------------- камеры
     def current_cams(self):
         return [int(v.get().split()[-1]) for v in self.vars]
 
@@ -123,21 +124,21 @@ class App:
 
     def on_cam(self, z):
         cams = self.current_cams()
-        if cams.count(cams[z]) > 1:                    # одну камеру в двух зонах выбирать нельзя
+        if cams.count(cams[z]) > 1:
             messagebox.showwarning("Выбор камеры", "Эта камера уже выбрана в другой зоне.")
             self.vars[z].set(f"Камера {self.zones[z].cam}")
             return
         self.zones[z].set_cam(cams[z])
         self.render(force=True)
 
-    # ---------------------------------------------------------------- управление
+
     def toggle(self):
         if self.playing:
-            self.playing = False; self.btn.config(text="▶ Пуск")
+            self.playing = False; self.btn.config(text="Пуск")
         else:
             if self.frame >= self.res.last_frame:
                 self.frame = self.res.start
-            self.playing = True; self.anchor = (time.perf_counter(), self.frame); self.btn.config(text="⏸ Пауза")
+            self.playing = True; self.anchor = (time.perf_counter(), self.frame); self.btn.config(text="Пауза")
 
     def on_scale(self, v):
         if self._slider_lock:
@@ -152,13 +153,12 @@ class App:
 
     def on_click(self, e):
         row = self.tree.identify_row(e.y)
-        if row and self.tree.selection() == (row,):          # повторный клик по выбранной строке снимает выбор
+        if row and self.tree.selection() == (row,):
             self.t.after_idle(self.clear_sel)
 
     def clear_sel(self):
         self.tree.selection_remove(self.tree.selection()); self.selected = None; self.render(force=True)
 
-    # ---------------------------------------------------------------- цикл
     def tick(self):
         if self.playing:
             el = time.perf_counter() - self.anchor[0]
@@ -166,8 +166,8 @@ class App:
             if tgt != self.frame:
                 self.frame = tgt
                 self.render()
-            if self.frame >= self.res.last_frame:       # конец: время останавливается, активные треки НЕ finished
-                self.playing = False; self.btn.config(text="▶ Пуск")
+            if self.frame >= self.res.last_frame:
+                self.playing = False; self.btn.config(text="Пуск")
         self.t.after(8, self.tick)
 
     def render(self, force=False):
@@ -176,7 +176,7 @@ class App:
             return
         self.last_drawn = f
         for z, zone in enumerate(self.zones):
-            img = zone.get(self.res.src_frame(zone.cam, f))    # кадр шкалы времени -> кадр видео камеры (разный fps)
+            img = zone.get(self.res.src_frame(zone.cam, f))
             if img is None:
                 continue
             ids, bx = self.res.boxes(f, zone.cam)

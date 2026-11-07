@@ -3,8 +3,11 @@ venv/
 __pycache__/
 *.pyc
 *.mkv
+*.mp4
+*.avi
 *.pkl
 *.pt
 *.onnx
 runs/
 calib_check_*.jpg
+.cache/

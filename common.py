@@ -1,12 +1,11 @@
-"""Общие утилиты: калибровка (дисторсия + гомографии камера->план), маски, время."""
 import json
 import os
 import numpy as np
 import cv2
 
 CAMERAS = [1, 2, 3, 4, 5]
-CANON = (1600, 1200)          # канонический размер кадра (из ТЗ); все расчёты ведутся в нём
-PLAN_SIZE = (180, 440)        # officePlan.jpg: ширина x высота, пиксели плана
+CANON = (1600, 1200)
+PLAN_SIZE = (180, 440)
 CALIB_FILE = "calibration.json"
 
 
@@ -15,7 +14,6 @@ def video_path(root, cam):
 
 
 def fmt_time(frame, fps):
-    """чч:мм:сс:мс (время от начала записи)."""
     ms = int(round(frame / fps * 1000.0))
     h, ms = divmod(ms, 3600000)
     m, ms = divmod(ms, 60000)
@@ -23,16 +21,12 @@ def fmt_time(frame, fps):
     return f"{h:02d}:{m:02d}:{s:02d}:{ms:03d}"
 
 
-# ---------------------------------------------------------------- дисторсия
-# Однопараметрическая "division model":  p_u = c + (p_d - c) / (1 + k * r_d^2),
-# r_d = |p_d - c| / R,  R = половина диагонали кадра.  k < 0 -> бочка (широкоугольник).
 def _geom():
     W, H = CANON
     return np.array([W / 2.0, H / 2.0]), float(np.hypot(W, H) / 2.0)
 
 
 def undistort_px(pts, k):
-    """pts: (N,2) пиксели канонического кадра (искажённые) -> неискажённые."""
     pts = np.asarray(pts, np.float64).reshape(-1, 2)
     c, R = _geom()
     d = pts - c
@@ -41,7 +35,6 @@ def undistort_px(pts, k):
 
 
 def distort_px(pts, k):
-    """Обратное преобразование (нужно для отрисовки проверок и remap)."""
     pts = np.asarray(pts, np.float64).reshape(-1, 2)
     c, R = _geom()
     d = pts - c
@@ -56,7 +49,6 @@ def distort_px(pts, k):
 
 
 def undistort_image(img, k):
-    """Для визуальной проверки коэффициента (кадр -> неискажённый кадр)."""
     h, w = img.shape[:2]
     gx, gy = np.meshgrid(np.arange(w), np.arange(h))
     pts = np.stack([gx.ravel() * CANON[0] / w, gy.ravel() * CANON[1] / h], 1)
@@ -66,7 +58,6 @@ def undistort_image(img, k):
     return cv2.remap(img, mapx, mapy, cv2.INTER_LINEAR)
 
 
-# ---------------------------------------------------------------- калибровка
 class Calibration:
     def __init__(self, data=None):
         self.data = data or {"k1": 0.0, "plan_size": list(PLAN_SIZE),
@@ -77,7 +68,6 @@ class Calibration:
         self._mask_cache = {}
         self._ghost = {}
 
-    # --- io
     @staticmethod
     def load(path=CALIB_FILE):
         if not os.path.exists(path):
@@ -102,7 +92,6 @@ class Calibration:
     def weight(self, c):
         return float(self.cam(c).get("weight", 1.0))
 
-    # --- гомография камера -> план
     def homography(self, c):
         if c in self._H:
             return self._H[c]
@@ -129,7 +118,6 @@ class Calibration:
         return self.homography(c) is not None
 
     def to_plan(self, c, pts_px):
-        """Точки (канонические пиксели кадра, искажённые) -> координаты плана."""
         H = self.homography(c)
         u = undistort_px(pts_px, self.k1)
         return cv2.perspectiveTransform(u.reshape(-1, 1, 2), H).reshape(-1, 2)
@@ -140,7 +128,6 @@ class Calibration:
                                      np.linalg.inv(H)).reshape(-1, 2)
         return distort_px(p, self.k1)
 
-    # --- проходимая область плана
     def walkable_mask(self, margin=0):
         key = int(margin)
         if key in self._mask_cache:
@@ -159,12 +146,11 @@ class Calibration:
 
     def is_walkable(self, xy, margin=0):
         if not self.data.get("walkable"):
-            return True                      # полигон не размечен -> не фильтруем
+            return True
         m = self.walkable_mask(margin)
         x, y = int(round(xy[0])), int(round(xy[1]))
         return 0 <= y < m.shape[0] and 0 <= x < m.shape[1] and m[y, x] > 0
 
-    # --- статичные маски "призраков" (ТВ и т.п.) в пикселях камеры
     def ghost_mask(self, c):
         if c not in self._ghost:
             m = np.zeros((CANON[1], CANON[0]), np.uint8)
@@ -175,17 +161,73 @@ class Calibration:
         return self._ghost[c]
 
 
-# ---------------------------------------------------------------- синхронизация камер по времени
-def build_timeline(info, target_fps):
-    """Единая шкала времени для камер с РАЗНЫМ fps.
-    info: {cam: (fps, n_frames)}; target_fps - общий fps шкалы.
-    Кадр шкалы k соответствует моменту t=(k+0.5)/target_fps; из камеры берётся кадр floor(t*fps_cam).
-    Индекс считается из времени, а не накопительным счётчиком -> ошибка не копируется:
-    у камеры с большим fps кадры равномерно пропускаются, у камеры с меньшим - равномерно дублируются.
-    Все записи начинаются и заканчиваются одновременно: длительность шкалы = min(n/fps) по камерам.
-    Возвращает (N кадров шкалы, {cam: int32-массив индексов исходных кадров длиной N})."""
-    dur = min(n / float(f) for f, n in info.values())
-    N = int(np.floor(dur * target_fps + 1e-6))
-    t = (np.arange(N) + 0.5) / target_fps
-    idx = {c: np.minimum(np.floor(t * f).astype(np.int64), n - 1).astype(np.int32) for c, (f, n) in info.items()}
-    return N, idx
+def scan_video(path, cache_dir=".cache", verbose=True):
+    os.makedirs(cache_dir, exist_ok=True)
+    st = os.stat(path)
+    cpath = os.path.join(cache_dir, os.path.basename(path) + ".pts.npz")
+    if os.path.exists(cpath):
+        z = np.load(cpath)
+        if int(z["size"]) == st.st_size and int(z["mtime"]) == int(st.st_mtime):
+            return z["pts"], float(z["nom_fps"]), int(z["nom_count"])
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise SystemExit("не открывается " + path)
+    nom_fps, nom_count = float(cap.get(cv2.CAP_PROP_FPS)), int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    pts = []
+    while cap.grab():
+        pts.append(cap.get(cv2.CAP_PROP_POS_MSEC))
+        if verbose and len(pts) % 5000 == 0:
+            print(f"  [scan] {os.path.basename(path)}: {len(pts)} frames", flush=True)
+    cap.release()
+    pts = np.array(pts, np.float64)
+    if len(pts) == 0:
+        raise SystemExit("пустое видео " + path)
+    if len(pts) > 2 and (np.mean(np.diff(pts) > 0) < 0.9):
+        fps = nom_fps if nom_fps > 0 else 25.0
+        print(f"  [scan] {os.path.basename(path)}: using nominal {fps} fps")
+        pts = np.arange(len(pts)) * 1000.0 / fps
+    pts = np.maximum.accumulate(pts)
+    np.savez(cpath, pts=pts, size=st.st_size, mtime=int(st.st_mtime), nom_fps=nom_fps, nom_count=nom_count)
+    return pts, nom_fps, nom_count
+
+
+def scan_all(paths):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(paths)) as ex:
+        futs = {c: ex.submit(scan_video, p) for c, p in paths.items()}
+        return {c: f.result() for c, f in futs.items()}
+
+
+def build_timeline(pts_by_cam, target_fps, normalize_spans=False):
+    rel, span = {}, {}
+    for c, p in pts_by_cam.items():
+        p = np.asarray(p, np.float64)
+        dt = float(np.median(np.diff(p))) if len(p) > 1 else 40.0
+        rel[c] = p - p[0]
+        span[c] = rel[c][-1] + dt
+    D = min(span.values())
+    N = int(np.floor(D / 1000.0 * target_fps + 1e-6))
+    t = np.arange(N) * 1000.0 / target_fps
+    idx, err = {}, {}
+    for c, r in rel.items():
+        tt = t * (span[c] / D) if normalize_spans else t
+        j = np.clip(np.searchsorted(r, tt), 1, len(r) - 1) if len(r) > 1 else np.zeros(N, int)
+        if len(r) > 1:
+            j = np.where(np.abs(r[j - 1] - tt) <= np.abs(r[j] - tt), j - 1, j)
+        idx[c] = j.astype(np.int32)
+        err[c] = float(np.abs(r[j] - tt).max()) if N else 0.0
+    return N, idx, err
+
+
+def seek_read(cap, pts_ms, i, back_ms=1500.0):
+    n = len(pts_ms)
+    for attempt in range(4):
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(pts_ms[i]) - back_ms * (2 ** attempt)))
+        for _ in range(900):
+            ok, fr = cap.read()
+            if not ok:
+                break
+            j = int(np.searchsorted(pts_ms, cap.get(cv2.CAP_PROP_POS_MSEC) - 0.5))
+            if j >= i:
+                return fr, min(j, n - 1)
+    return None, -1

@@ -1,11 +1,10 @@
-"""Доступ к результатам fusion_result.pkl + функции отрисовки (без зависимости от GUI-библиотеки)."""
 import pickle
 import bisect
 import numpy as np
 import cv2
 from common import fmt_time, PLAN_SIZE
 
-PRESENCE_WINDOW = 3      # "V" в таблице, если на камере была детекция за последние N кадров
+PRESENCE_WINDOW = 3
 
 
 def id_color(i):
@@ -24,13 +23,13 @@ class Result:
         self.n_frames = int(d["n_frames"])
         self.last_frame = self.start + self.n_frames - 1
         self.cameras = list(d["cameras"])
-        self.src_index = d.get("src_index")       # {камера: индекс кадра исходного видео для каждого кадра шкалы}
+        self.src_index = d.get("src_index")
+        self.src_pts = d.get("src_pts_ms")
         self.tracks = d["tracks"]
         self.ids = sorted(self.tracks)
         f = d["f"]; order = np.argsort(f, kind="stable")
         self.f = f[order]; self.cam = d["cam"][order]; self.gid = d["gid"][order]
         self.box = d["box"][order]; self.plan = d["plan"][order]; self.fok = d["foot_ok"][order]
-        # траектории на плане: по кадру - взвешенное среднее проекций всех камер
         self.traj = {}
         for i in self.ids:
             m = self.gid == i
@@ -43,22 +42,22 @@ class Result:
             xy = np.zeros((len(uf), 2)); ws = np.zeros(len(uf))
             np.add.at(xy, inv, pp * w[:, None]); np.add.at(ws, inv, w)
             xy /= ws[:, None]
-            k = 7                                                    # лёгкое сглаживание траектории
+            k = 7
             if len(xy) >= k:
                 pad = np.pad(xy, ((k // 2, k // 2), (0, 0)), mode="edge")
                 xy = np.stack([np.convolve(pad[:, j], np.ones(k) / k, mode="valid") for j in range(2)], 1)
             self.traj[i] = (uf, xy)
-        # первый кадр, на котором ID был замечен на камере (для статуса "X" в таблице)
         self.first_seen = {}
         for g, c, f_ in zip(self.gid, self.cam, self.f):
             k = (int(g), int(c))
             if k not in self.first_seen:
-                self.first_seen[k] = int(f_)                    # строки отсортированы по кадру
+                self.first_seen[k] = int(f_)
         self._a = np.searchsorted(self.f, np.arange(self.start, self.last_frame + 2), "left")
 
-    # ---------------------------------------------------------------- запросы
+    def pts_of(self, cam):
+        return None if not self.src_pts or cam not in self.src_pts else self.src_pts[cam]
+
     def src_frame(self, cam, frame):
-        """Кадр шкалы времени -> номер кадра в видео этой камеры (камеры могут иметь разный fps)."""
         if not self.src_index or cam not in self.src_index:
             return frame
         arr = self.src_index[cam]
@@ -98,7 +97,6 @@ class Result:
         return rows
 
     def _cam_status(self, i, c, frame, seen):
-        """'V' - сейчас на камере; 'X' - на камере уже появлялся, но сейчас не в её поле зрения; ' ' - не появлялся."""
         if c in seen.get(i, ()):
             return "V"
         return "X" if self.first_seen.get((i, c), 10 ** 12) <= frame else " "
@@ -113,9 +111,7 @@ class Result:
         return None if len(r) == 0 else r[-1]
 
 
-# ---------------------------------------------------------------- отрисовка
 def draw_video(img, ids, boxes, size):
-    """img: BGR кадр; boxes нормированы. Рамки + ID на кадре, уменьшенном до size=(w,h)."""
     w, h = size
     v = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
     for gid, b in zip(ids, boxes):
@@ -130,7 +126,6 @@ def draw_video(img, ids, boxes, size):
 
 
 def draw_plan(plan_bgr, res, frame, selected, size):
-    """Выбран трек -> весь сохранённый к текущему моменту маршрут; иначе - позиции всех активных ID."""
     w, h = size
     sx, sy = w / plan_bgr.shape[1], h / plan_bgr.shape[0]
     v = cv2.resize(plan_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
