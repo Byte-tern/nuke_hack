@@ -1,0 +1,8 @@
+# Python 3.11 или 3.12 (на 3.14 готовых сборок torch может не быть)
+# Сначала установите torch (CPU или CUDA) отдельно: команда с https://pytorch.org, затем:
+ultralytics>=8.3        # YOLO11-pose + BoT-SORT
+opencv-python
+numpy
+scipy
+Pillow
+# tkinter входит в стандартный Python для Windows (Linux: sudo apt install python3-tk)
