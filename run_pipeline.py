@@ -1,8 +1,8 @@
-"""Один запуск всего конвейера: этап 1 -> склейка -> интерфейс.
-  python run_pipeline.py --root D:\\data            # root - папка с camera_new_[1..5].mkv
-  python run_pipeline.py --root . --skip-stage1     # пересчитать только склейку и открыть интерфейс
-Дополнительные аргументы этапа 1 передаются после --, например:  -- --max-frames 1500 --zoom 3:0.18,0,0.5,0.45
 """
+Запускать в папке с camera_new_[1..5].mkv
+python run_pipeline.py --root . --skip-stage1     # пересчитать только склейку и открыть интерфейс
+"""
+
 import argparse
 import os
 import subprocess
