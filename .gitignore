@@ -5,7 +5,6 @@ __pycache__/
 *.mkv
 *.mp4
 *.avi
-*.pkl
 *.pt
 *.onnx
 runs/
